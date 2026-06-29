@@ -1,0 +1,199 @@
+#!/usr/bin/env python3
+import json
+import time
+import rclpy
+from rclpy.node import Node
+from geometry_msgs.msg import Twist
+from unitree_api.msg import Request
+
+SPORT_API_BALANCESTAND = 1002
+SPORT_API_STOPMOVE = 1003
+SPORT_API_MOVE = 1008
+
+
+class CmdVelToSport(Node):
+    def __init__(self): 
+        super().__init__('cmd_vel_to_sport')
+
+        # ===== Parameters =====
+        self.declare_parameter('cmd_vel_topic', '/cmd_vel')
+        self.declare_parameter('sport_request_topic', '/api/sport/request')
+        self.declare_parameter('max_vx', 0.6)
+        self.declare_parameter('max_vy', 0.3)
+        self.declare_parameter('max_vyaw', 1.5)
+        self.declare_parameter('cmd_timeout', 0.5)
+        self.declare_parameter('publish_rate', 20.0)
+        self.declare_parameter('zero_deadband', 0.02)
+        self.declare_parameter('init_balance_stand', True)   # NEW
+        self.declare_parameter('init_wait_sec', 2.0)         # NEW
+
+        self.cmd_vel_topic = self.get_parameter('cmd_vel_topic').value
+        self.sport_request_topic = self.get_parameter('sport_request_topic').value
+        self.max_vx = float(self.get_parameter('max_vx').value)
+        self.max_vy = float(self.get_parameter('max_vy').value)
+        self.max_vyaw = float(self.get_parameter('max_vyaw').value)
+        self.cmd_timeout = float(self.get_parameter('cmd_timeout').value)
+        self.publish_rate = float(self.get_parameter('publish_rate').value)
+        self.zero_deadband = float(self.get_parameter('zero_deadband').value)
+        self.init_balance_stand = bool(self.get_parameter('init_balance_stand').value)
+        self.init_wait_sec = float(self.get_parameter('init_wait_sec').value)
+
+        # ===== State =====
+        self.last_vx = 0.0
+        self.last_vy = 0.0
+        self.last_vyaw = 0.0
+        self.last_cmd_time = None
+        self.is_stopped = True
+        self.is_ready = False                            # NEW: 초기화 완료 여부
+        self.init_start_time = self.get_clock().now()    # NEW: 노드 시작 시각
+
+        # ===== Pub/Sub =====
+        self.pub = self.create_publisher(Request, self.sport_request_topic, 10)
+        self.sub = self.create_subscription(
+            Twist, self.cmd_vel_topic, self.cmd_callback, 10
+        )
+
+        # ===== Timer: continuously resend last command =====
+        period = 1.0 / self.publish_rate
+        self.send_timer = self.create_timer(period, self.send_loop)
+
+        # ===== Init sequence: BalanceStand at startup =====
+        if self.init_balance_stand:
+            # 약간 지연 후 BalanceStand 발행 (publisher 준비 시간)
+            self.init_timer = self.create_timer(0.3, self.do_init_balance)
+            self.balance_sent = False
+        else:
+            self.is_ready = True
+
+        self.get_logger().info('=' * 60)
+        self.get_logger().info('cmd_vel_to_sport started')
+        self.get_logger().info(f'subscribe: {self.cmd_vel_topic}')
+        self.get_logger().info(f'publish  : {self.sport_request_topic} @ {self.publish_rate} Hz')
+        self.get_logger().info(
+            f'limits: max_vx={self.max_vx}, max_vy={self.max_vy}, max_vyaw={self.max_vyaw}'
+        )
+        if self.init_balance_stand:
+            self.get_logger().info(
+                f'[INIT] BalanceStand will be sent, '
+                f'then waiting {self.init_wait_sec}s before accepting cmd_vel'
+            )
+        self.get_logger().info('=' * 60)
+
+    def clamp(self, value, limit):
+        if limit <= 0.0:
+            return 0.0
+        return max(-limit, min(limit, value))
+
+    def apply_deadband(self, value):
+        return 0.0 if abs(value) < self.zero_deadband else value
+
+    def send_balance_stand(self):
+        req = Request()
+        req.header.identity.id = int(time.time_ns() & 0x7FFFFFFF)
+        req.header.identity.api_id = SPORT_API_BALANCESTAND
+        req.header.policy.priority = 0
+        req.header.policy.noreply = True
+        req.parameter = ''
+        self.pub.publish(req)
+
+    def send_stopmove(self):
+        req = Request()
+        req.header.identity.id = int(time.time_ns() & 0x7FFFFFFF)
+        req.header.identity.api_id = SPORT_API_STOPMOVE
+        req.header.policy.priority = 0
+        req.header.policy.noreply = True
+        req.parameter = ''
+        self.pub.publish(req)
+
+    def send_move(self, vx, vy, vyaw):
+        req = Request()
+        req.header.identity.id = int(time.time_ns() & 0x7FFFFFFF)
+        req.header.identity.api_id = SPORT_API_MOVE
+        req.header.policy.priority = 0
+        req.header.policy.noreply = True
+        req.parameter = json.dumps({
+            'x': float(vx),
+            'y': float(vy),
+            'z': float(vyaw),
+        })
+        self.pub.publish(req)
+
+    def do_init_balance(self):
+        """노드 시작 0.3초 후 BalanceStand 1회 발행, 이후 init_wait_sec 대기."""
+        if not self.balance_sent:
+            self.get_logger().info('[INIT] Sending BalanceStand...')
+            self.send_balance_stand()
+            self.balance_sent = True
+            self.init_start_time = self.get_clock().now()
+            return
+
+        # 대기 시간 경과 확인
+        elapsed = (self.get_clock().now() - self.init_start_time).nanoseconds * 1e-9
+        if elapsed >= self.init_wait_sec:
+            self.get_logger().info('[INIT] Ready. Accepting /cmd_vel commands now.')
+            self.is_ready = True
+            self.init_timer.cancel()
+
+    def cmd_callback(self, msg):
+        vx = self.clamp(msg.linear.x, self.max_vx)
+        vy = self.clamp(msg.linear.y, self.max_vy)
+        vyaw = self.clamp(msg.angular.z, self.max_vyaw)
+
+        vx = self.apply_deadband(vx)
+        vy = self.apply_deadband(vy)
+        vyaw = self.apply_deadband(vyaw)
+
+        self.last_vx = vx
+        self.last_vy = vy
+        self.last_vyaw = vyaw
+        self.last_cmd_time = self.get_clock().now()
+
+    def send_loop(self):
+        # 초기화 미완료: 아무것도 안 보냄 (BalanceStand 유지)
+        if not self.is_ready:
+            return
+
+        if self.last_cmd_time is None:
+            return
+
+        dt = (self.get_clock().now() - self.last_cmd_time).nanoseconds * 1e-9
+
+        # 타임아웃: 정지
+        if dt > self.cmd_timeout:
+            if not self.is_stopped:
+                self.get_logger().warn('cmd_vel timeout. Send StopMove.')
+                self.send_stopmove()
+                self.is_stopped = True
+            return
+
+        # 모두 0: 정지
+        if (self.last_vx == 0.0 and self.last_vy == 0.0 and self.last_vyaw == 0.0):
+            if not self.is_stopped:
+                self.send_stopmove()
+                self.is_stopped = True
+            return
+
+        # 정상 주행: 20Hz로 마지막 명령 반복 전송
+        self.send_move(self.last_vx, self.last_vy, self.last_vyaw)
+        self.is_stopped = False
+
+
+def main(args=None):
+    rclpy.init(args=args)
+    node = CmdVelToSport()
+    try:
+        rclpy.spin(node)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        try:
+            node.send_stopmove()
+            time.sleep(0.1)
+        except Exception:
+            pass
+        node.destroy_node()
+        rclpy.shutdown()
+
+
+if __name__ == '__main__':
+    main()
